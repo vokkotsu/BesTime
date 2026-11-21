@@ -15,6 +15,8 @@ from src.config import (
     RAIN_PENALTY_CAP_MINUTES,
     RAIN_PENALTY_PER_MM,
     RUSH_WINDOWS,
+    TOMTOM_API_KEY,
+    TOMTOM_ROUTE_URL,
     RouteConfig,
 )
 
@@ -45,6 +47,101 @@ def fetch_osrm_baseline(route: RouteConfig, timeout: int = 20) -> dict:
         "base_duration_min": float(best["duration"]) / 60.0,
         "source": "osrm",
     }
+
+
+def fetch_tomtom_traffic_duration(
+    origin: tuple[float, float] | RouteConfig,
+    destination: tuple[float, float] | None = None,
+    depart_at: datetime | None = None,
+    api_key: str | None = None,
+    timeout: int = 20,
+) -> dict:
+    """Fetch live traffic-aware travel duration from TomTom Calculate Route API.
+
+    Args:
+        origin: (lat, lon) tuple, or a RouteConfig (destination then inferred from route).
+        destination: (lat, lon) tuple when origin is a coordinate tuple.
+        depart_at: Optional departure datetime for traffic-aware routing.
+    """
+    key = (api_key or TOMTOM_API_KEY or "").strip()
+    if not key:
+        raise RoutingError("TOMTOM_API_KEY is not configured")
+
+    if isinstance(origin, RouteConfig):
+        route = origin
+        o_lat, o_lon = route.origin_lat, route.origin_lon
+        d_lat, d_lon = route.dest_lat, route.dest_lon
+        route_id = route.route_id
+    else:
+        if destination is None:
+            raise ValueError("destination is required when origin is a coordinate tuple")
+        o_lat, o_lon = origin
+        d_lat, d_lon = destination
+        route_id = "custom"
+
+    url = TOMTOM_ROUTE_URL.format(lat1=o_lat, lon1=o_lon, lat2=d_lat, lon2=d_lon)
+    params = {
+        "traffic": "true",
+        "travelMode": "car",
+        "key": key,
+    }
+    if depart_at is not None:
+        params["departAt"] = depart_at.isoformat()
+
+    response = requests.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    routes = payload.get("routes", [])
+    if not routes:
+        raise RoutingError("TomTom returned no routes")
+    summary = routes[0].get("summary", {})
+    travel_time_sec = summary.get("travelTimeInSeconds")
+    if travel_time_sec is None:
+        raise RoutingError("TomTom response missing travelTimeInSeconds")
+    traffic_delay_sec = float(summary.get("trafficDelayInSeconds", 0.0) or 0.0)
+    length_m = float(summary.get("lengthInMeters", 0.0) or 0.0)
+
+    return {
+        "route_id": route_id,
+        "travel_time_min": float(travel_time_sec) / 60.0,
+        "traffic_delay_min": traffic_delay_sec / 60.0,
+        "distance_km": length_m / 1000.0 if length_m > 0 else None,
+        "source": "tomtom",
+        "raw_summary": summary,
+    }
+
+
+def get_live_travel_duration(
+    route: RouteConfig,
+    depart_at: datetime | None = None,
+    precipitation_mm: float = 0.0,
+    rain_mm: float = 0.0,
+    rng: np.random.Generator | None = None,
+) -> dict:
+    """Get real TomTom duration, falling back to OSRM baseline + calibrated synthetic simulator."""
+    depart_at = depart_at or datetime.now()
+    try:
+        result = fetch_tomtom_traffic_duration(route, depart_at=depart_at)
+        result["source"] = "real_api"
+        return result
+    except Exception:
+        baseline = estimate_baseline(route)
+        rng = rng or np.random.default_rng()
+        simulated = simulate_observed_duration(
+            base_duration_min=float(baseline["base_duration_min"]),
+            departure_dt=depart_at,
+            precipitation_mm=precipitation_mm,
+            rain_mm=rain_mm,
+            rng=rng,
+        )
+        return {
+            "route_id": route.route_id,
+            "travel_time_min": float(simulated),
+            "traffic_delay_min": max(0.0, float(simulated) - float(baseline["base_duration_min"])),
+            "distance_km": baseline.get("distance_km"),
+            "source": "synthetic",
+            "baseline_source": baseline.get("source"),
+        }
 
 
 def estimate_baseline(route: RouteConfig) -> dict:
@@ -178,7 +275,7 @@ def generate_synthetic_trips(
                 "route_id": route.route_id,
                 "departure_ts": ts,
                 "observed_duration_min": round(observed, 2),
-                "source": "synthetic_bootstrap",
+                "source": "synthetic",
                 "base_duration_min": base_duration_min,
                 "distance_km": None,
             }

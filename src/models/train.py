@@ -19,6 +19,9 @@ from src.config import (
     MODEL_FEATURES,
     QUANTILES,
     RANDOM_STATE,
+    REAL_SOURCE_WEIGHT,
+    REAL_TRAINING_MIN_ROWS,
+    SYNTHETIC_SOURCE_WEIGHT,
     TARGET_COLUMN,
     TEST_DAYS,
 )
@@ -62,6 +65,28 @@ def _metrics_path(route_id: str) -> Path:
     return MODELS_DIR / f"{route_id}_metrics.json"
 
 
+def _is_real_source(source: pd.Series) -> pd.Series:
+    return source.astype(str).isin(["real_api", "user_log", "tomtom", "live_api"])
+
+
+def _select_training_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+    real_mask = _is_real_source(frame.get("source", pd.Series(dtype=str)))
+    real_count = int(real_mask.sum())
+    synthetic_count = int((~real_mask).sum())
+    if real_count >= REAL_TRAINING_MIN_ROWS:
+        selected = frame[real_mask].copy()
+        strategy = "real_only"
+    else:
+        selected = frame.copy()
+        strategy = "hybrid_weighted"
+    meta = {
+        "real_rows": float(real_count),
+        "synthetic_rows": float(synthetic_count),
+        "training_strategy_real_only": 1.0 if strategy == "real_only" else 0.0,
+    }
+    return selected, meta
+
+
 def train_route_models(
     route_id: str,
     db_path: Path = DUCKDB_PATH,
@@ -75,15 +100,23 @@ def train_route_models(
         # Caller should have bootstrapped; we still train but warn through metrics.
         pass
 
-    train_df, test_df = _time_split(frame)
+    training_frame, strategy_meta = _select_training_frame(frame)
+    train_df, test_df = _time_split(training_frame)
     X_train, y_train = get_training_matrix(train_df)
     X_test, y_test = get_training_matrix(test_df)
+    train_weights = np.where(
+        _is_real_source(train_df.get("source", pd.Series(["synthetic"] * len(train_df)))),
+        REAL_SOURCE_WEIGHT,
+        SYNTHETIC_SOURCE_WEIGHT,
+    )
 
     model_paths: dict[str, str] = {}
     metrics: dict[str, float] = {
         "rows": float(len(frame)),
+        "selected_rows": float(len(training_frame)),
         "train_rows": float(len(train_df)),
         "test_rows": float(len(test_df)),
+        **strategy_meta,
     }
 
     predictions: dict[str, np.ndarray] = {}
@@ -99,7 +132,7 @@ def train_route_models(
             min_child_samples=20,
             random_state=RANDOM_STATE,
         )
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, sample_weight=train_weights)
         path = _model_path(route_id, name)
         joblib.dump({"model": model, "features": MODEL_FEATURES, "quantile": alpha}, path)
         model_paths[name] = str(path)

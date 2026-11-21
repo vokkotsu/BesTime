@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    # Optional dependency; env vars still work without python-dotenv.
+    pass
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +28,8 @@ PROCESSED_FEATURES_PATH = DATA_DIR / "features.parquet"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OSRM_ROUTE_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+TOMTOM_ROUTE_URL = "https://api.tomtom.com/routing/1/calculateRoute/{lat1},{lon1}:{lat2},{lon2}/json"
+TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
 
 DEFAULT_TIMEZONE = "Asia/Jakarta"
 DEPARTURE_INTERVAL_MINUTES = 15
@@ -115,6 +126,11 @@ QUANTILES = {"p50": 0.5, "p90": 0.9}
 RANDOM_STATE = 42
 TEST_DAYS = 7
 MIN_TRAINING_ROWS = 300
+REAL_TRAINING_MIN_ROWS = 300
+REAL_SOURCE_WEIGHT = 10.0
+SYNTHETIC_SOURCE_WEIGHT = 1.0
+COLLECTOR_ACTIVE_START_HOUR = 5
+COLLECTOR_ACTIVE_END_HOUR = 22
 CLIFF_MIN_INCREASE_MINUTES = 12.0
 CLIFF_MIN_INCREASE_PCT = 0.15
 DIMINISHING_ELEVATED_RATIO = 1.15  # only flag diminishing returns when above free-flow baseline

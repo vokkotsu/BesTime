@@ -17,7 +17,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import DEFAULT_ROUTE_ID, DUCKDB_PATH, MODEL_FEATURES, ROUTES  # noqa: E402
-from src.ingestion.pipeline import get_connection, log_user_trip, run_pipeline  # noqa: E402
+from src.ingestion.pipeline import (  # noqa: E402
+    collect_live_observation,
+    get_connection,
+    get_observation_counts,
+    log_user_trip,
+    run_pipeline,
+)
 from src.models.predict import detect_zones, predict_departure_curve, summarize_zones  # noqa: E402
 from src.models.train import load_metrics, load_route_models, train_route_models  # noqa: E402
 
@@ -218,6 +224,22 @@ def main() -> None:
 
         st.divider()
         st.header("Data / Model")
+        counts = get_observation_counts(route_id, db_path=DUCKDB_PATH) if DUCKDB_PATH.exists() else {"real_api": 0, "user_log": 0, "synthetic": 0, "total": 0}
+        st.caption("Data health")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Real API", counts.get("real_api", 0))
+        c2.metric("User logs", counts.get("user_log", 0))
+        c3.metric("Synthetic", counts.get("synthetic", 0))
+
+        if st.button("Fetch Live Traffic Now", use_container_width=True):
+            with st.spinner("Collecting live traffic + weather..."):
+                obs = collect_live_observation(route_id)
+            st.success(
+                f"Logged {obs['source']} observation at {obs['departure_ts']}: "
+                f"{obs['observed_duration_min']:.1f} min"
+            )
+            st.cache_data.clear()
+
         if st.button("Refresh data pipeline", use_container_width=True):
             with st.spinner("Running ingestion pipeline..."):
                 result = run_pipeline(route_ids=[route_id])

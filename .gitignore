@@ -31,6 +31,11 @@ data/
 .coverage
 htmlcov/
 
+# Env
+.env
+.env.*
+!.env.example
+
 # Logs
 *.log
 

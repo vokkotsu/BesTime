@@ -9,7 +9,7 @@ import duckdb
 import pandas as pd
 
 from src.config import DATA_DIR, DUCKDB_PATH, ROUTES, RouteConfig
-from src.ingestion.routing import estimate_baseline, generate_synthetic_trips
+from src.ingestion.routing import estimate_baseline, generate_synthetic_trips, get_live_travel_duration
 from src.ingestion.weather import fetch_weather_for_route, normalize_weather_columns
 
 
@@ -350,6 +350,136 @@ def run_pipeline(
             summary["trip_rows"] += trip_count
 
     return summary
+
+
+def _fetch_live_weather_row(route_id: str, lat: float, lon: float, departure_ts: pd.Timestamp) -> dict:
+    """Fetch current-hour weather for live observation; fallback to zeros on failure."""
+    try:
+        df = fetch_weather_for_route(
+            route_id=route_id,
+            latitude=lat,
+            longitude=lon,
+            include_forecast=True,
+        )
+    except Exception:
+        return {"precipitation": 0.0, "rain": 0.0, "weathercode": 0.0, "windspeed_10m": 0.0}
+
+    if df.empty:
+        return {"precipitation": 0.0, "rain": 0.0, "weathercode": 0.0, "windspeed_10m": 0.0}
+    df = df.copy()
+    df["timestamp_local"] = pd.to_datetime(df["timestamp_local"])
+    hour_ts = departure_ts.floor("h")
+    exact = df[df["timestamp_local"] == hour_ts]
+    row = exact.iloc[-1] if not exact.empty else df.iloc[(df["timestamp_local"] - hour_ts).abs().argsort().iloc[0]]
+    return {
+        "precipitation": float(row.get("precipitation", 0.0)),
+        "rain": float(row.get("rain", 0.0)),
+        "weathercode": float(row.get("weathercode", 0.0)),
+        "windspeed_10m": float(row.get("windspeed_10m", 0.0)),
+    }
+
+
+def collect_live_observation(
+    route_id: str,
+    db_path: Path = DUCKDB_PATH,
+    depart_at: datetime | None = None,
+) -> dict:
+    """Fetch live weather + live traffic duration and upsert into DuckDB."""
+    if route_id not in ROUTES:
+        raise ValueError(f"Unknown route_id: {route_id}")
+
+    route = ROUTES[route_id]
+    departure_ts = pd.Timestamp(depart_at or datetime.now()).floor("min")
+    weather_row = _fetch_live_weather_row(route_id, route.origin_lat, route.origin_lon, departure_ts)
+
+    traffic = get_live_travel_duration(
+        route,
+        depart_at=departure_ts.to_pydatetime(),
+        precipitation_mm=weather_row["precipitation"],
+        rain_mm=weather_row["rain"],
+    )
+
+    with get_connection(db_path) as conn:
+        weather_frame = pd.DataFrame(
+            [
+                {
+                    "route_id": route_id,
+                    "timestamp_local": departure_ts.floor("h"),
+                    "precipitation": weather_row["precipitation"],
+                    "rain": weather_row["rain"],
+                    "weathercode": weather_row["weathercode"],
+                    "windspeed_10m": weather_row["windspeed_10m"],
+                    "source": "open_meteo_live",
+                    "latitude": route.origin_lat,
+                    "longitude": route.origin_lon,
+                    "timezone": "auto",
+                    "fetched_at_utc": pd.Timestamp.now("UTC"),
+                }
+            ]
+        )
+        upsert_weather(conn, weather_frame)
+
+        route_row = _fetchone(
+            conn,
+            "SELECT base_duration_min, distance_km FROM routes WHERE route_id = ?",
+            [route_id],
+        )
+        base_duration_min = route_row[0] if route_row else None
+        distance_km = route_row[1] if route_row else traffic.get("distance_km")
+
+        trip_frame = pd.DataFrame(
+            [
+                {
+                    "route_id": route_id,
+                    "departure_ts": departure_ts,
+                    "observed_duration_min": float(traffic["travel_time_min"]),
+                    "source": traffic.get("source", "synthetic"),
+                    "base_duration_min": base_duration_min,
+                    "distance_km": distance_km,
+                }
+            ]
+        )
+        upsert_trips(conn, trip_frame)
+
+    return {
+        "route_id": route_id,
+        "departure_ts": departure_ts.isoformat(),
+        "observed_duration_min": float(traffic["travel_time_min"]),
+        "source": traffic.get("source", "synthetic"),
+        "precipitation_mm": float(weather_row["precipitation"]),
+        "rain_mm": float(weather_row["rain"]),
+    }
+
+
+def get_observation_counts(route_id: str | None = None, db_path: Path = DUCKDB_PATH) -> dict:
+    with get_connection(db_path) as conn:
+        params: list = []
+        where = ""
+        if route_id:
+            where = "WHERE route_id = ?"
+            params.append(route_id)
+        rows = _fetchdf(
+            conn,
+            f"""
+            SELECT
+                SUM(CASE WHEN source IN ('real_api','tomtom','live_api') THEN 1 ELSE 0 END) AS real_api,
+                SUM(CASE WHEN source = 'user_log' THEN 1 ELSE 0 END) AS user_log,
+                SUM(CASE WHEN source IN ('synthetic','synthetic_bootstrap') THEN 1 ELSE 0 END) AS synthetic,
+                COUNT(*) AS total
+            FROM trip_observations
+            {where}
+            """,
+            params,
+        )
+    if rows.empty:
+        return {"real_api": 0, "user_log": 0, "synthetic": 0, "total": 0}
+    r = rows.iloc[0].fillna(0)
+    return {
+        "real_api": int(r.get("real_api", 0)),
+        "user_log": int(r.get("user_log", 0)),
+        "synthetic": int(r.get("synthetic", 0)),
+        "total": int(r.get("total", 0)),
+    }
 
 
 def read_table(table: str, db_path: Path = DUCKDB_PATH) -> pd.DataFrame:
