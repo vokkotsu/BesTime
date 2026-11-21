@@ -37,10 +37,32 @@ def test_detect_zones_flags_delay_cliff():
 
 
 def test_detect_zones_flags_diminishing_returns():
-    # Early departures are similarly slow/flat; leaving 45 min earlier saves little.
-    curve = _make_curve([58, 58, 58, 57, 50, 45])
+    # Elevated congestion: current slot is above free-flow, but leaving 45 min earlier
+    # saves <10 min in arrival clock time (07:30 - 07:21 = 9 min).
+    base = datetime(2026, 1, 6, 6, 0)
+    departures = [base + timedelta(minutes=15 * i) for i in range(6)]
+    durations = [81, 68, 56, 45, 40, 38]
+    curve = pd.DataFrame(
+        {
+            "departure_ts": departures,
+            "duration_p50_min": durations,
+            "duration_p90_min": [d + 8 for d in durations],
+        }
+    )
+    curve["arrival_p50_ts"] = curve["departure_ts"] + pd.to_timedelta(curve["duration_p50_min"], unit="m")
+    curve["arrival_p90_ts"] = curve["departure_ts"] + pd.to_timedelta(curve["duration_p90_min"], unit="m")
+    curve["risk_spread_min"] = curve["duration_p90_min"] - curve["duration_p50_min"]
     out = detect_zones(curve)
-    assert "diminishing_return" in out["zone"].tolist()
+    assert out.loc[0, "zone"] == "diminishing_return"
+
+
+def test_detect_zones_does_not_flag_flat_free_flow():
+    # Flat free-flow should not be diminishing return.
+    curve = _make_curve([35, 35, 35, 35, 35, 35, 35, 35])
+    curve["arrival_p50_ts"] = curve["departure_ts"] + pd.to_timedelta(curve["duration_p50_min"], unit="m")
+    curve["arrival_p90_ts"] = curve["departure_ts"] + pd.to_timedelta(curve["duration_p90_min"], unit="m")
+    out = detect_zones(curve)
+    assert "diminishing_return" not in out["zone"].tolist()
 
 
 def test_feature_inference_columns_present():

@@ -100,27 +100,37 @@ def simulate_observed_duration(
     rain_mm: float,
     rng: np.random.Generator,
 ) -> float:
-    """Generate realistic non-linear travel duration with rush-hour and rain effects."""
+    """Generate realistic non-linear travel duration with rush-hour and rain effects.
+
+    Calibration target (Jakarta-style commute, base/free-flow ~35 min):
+    - Free flow: ~35 min
+    - Rush peak: ~65-80 min
+    - Heavy rain during rush P90 tail risk: ~95-115 min (via rain amplification + incidents)
+    """
     hour_decimal = departure_dt.hour + departure_dt.minute / 60.0
     rush = rush_intensity(hour_decimal)
     weekday = departure_dt.weekday() < 5
-    weekday_factor = 1.0 if weekday else 0.72
+    weekday_factor = 1.0 if weekday else 0.68
 
-    # Non-linear congestion: modest early, steep near peak saturation.
-    congestion_multiplier = 1.0 + weekday_factor * (0.55 * rush + 1.25 * (rush**2.2))
+    # Non-linear congestion: free-flow near baseline, steep near peak saturation.
+    congestion_multiplier = 1.0 + weekday_factor * (0.20 * rush + 1.85 * (rush**2.1))
 
     # Rain penalty: amplified during rush to create delay cliffs.
     rain_signal = max(float(precipitation_mm), float(rain_mm))
     rain_penalty = min(RAIN_PENALTY_CAP_MINUTES, RAIN_PENALTY_PER_MM * rain_signal)
-    rain_multiplier = 1.0 + (rain_penalty / max(base_duration_min, 1.0)) * (0.65 + 1.1 * rush)
+    rain_intensity = min(rain_signal / 10.0, 1.0)
+    rain_multiplier = 1.0 + (rain_penalty / max(base_duration_min, 1.0)) * (0.35 + 1.75 * rush)
 
-    # Incident tail-risk: rare but more likely in heavy rain + peak rush.
-    incident_prob = 0.015 + 0.08 * rush + 0.02 * min(rain_signal, 10.0) / 10.0
-    incident_minutes = float(rng.gamma(shape=2.0, scale=8.0)) if rng.random() < incident_prob else 0.0
+    # Incident tail-risk: rare but heavier in heavy rain + peak rush; drives P90 spikes.
+    incident_prob = 0.01 + 0.05 * rush + 0.12 * rain_intensity * rush
+    incident_minutes = 0.0
+    if rng.random() < incident_prob:
+        scale = 6.0 + 12.0 * rush + 14.0 * rain_intensity
+        incident_minutes = float(rng.gamma(shape=2.4, scale=scale))
 
-    noise = float(rng.normal(0.0, 2.5 + 4.0 * rush))
+    noise = float(rng.normal(0.0, 1.5 + 3.0 * rush + 2.0 * rain_intensity))
     duration = base_duration_min * congestion_multiplier * rain_multiplier + incident_minutes + noise
-    return float(np.clip(duration, base_duration_min * 0.85, base_duration_min * 3.5))
+    return float(np.clip(duration, base_duration_min * 0.9, base_duration_min * 4.2))
 
 
 def generate_synthetic_trips(

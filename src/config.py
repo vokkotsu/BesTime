@@ -69,9 +69,11 @@ ROUTES: dict[str, RouteConfig] = {
 DEFAULT_ROUTE_ID = "bsd_jakarta"
 
 # Rush-hour shape parameters used by synthetic routing fallback and feature heuristics.
+# Calibrated for Jakarta-style commutes: free-flow ~35 min, rush peak ~65-80 min,
+# heavy rain during rush can push P90 tail risk to ~95-115 min.
 RUSH_WINDOWS = [
-    {"name": "morning", "start_hour": 6.0, "peak_hour": 7.5, "end_hour": 10.0, "amplitude": 0.55},
-    {"name": "evening", "start_hour": 16.5, "peak_hour": 18.0, "end_hour": 20.5, "amplitude": 0.50},
+    {"name": "morning", "start_hour": 5.5, "peak_hour": 7.25, "end_hour": 9.5, "amplitude": 0.78},
+    {"name": "evening", "start_hour": 16.0, "peak_hour": 17.75, "end_hour": 20.0, "amplitude": 0.74},
 ]
 
 WEATHER_HOURLY_FIELDS = [
@@ -81,9 +83,9 @@ WEATHER_HOURLY_FIELDS = [
     "windspeed_10m",
 ]
 
-# P90 adds extra tail-risk minutes based on rain intensity.
-RAIN_PENALTY_PER_MM = 2.0
-RAIN_PENALTY_CAP_MINUTES = 35.0
+# Rain effects: amplified during rush to create non-linear delay cliffs and P90 tail risk.
+RAIN_PENALTY_PER_MM = 2.8
+RAIN_PENALTY_CAP_MINUTES = 45.0
 
 MODEL_FEATURES = [
     "departure_hour",
@@ -115,5 +117,6 @@ TEST_DAYS = 7
 MIN_TRAINING_ROWS = 300
 CLIFF_MIN_INCREASE_MINUTES = 12.0
 CLIFF_MIN_INCREASE_PCT = 0.15
-DIMINISHING_MAX_SAVING_MINUTES = 3.0
+DIMINISHING_ELEVATED_RATIO = 1.15  # only flag diminishing returns when above free-flow baseline
+DIMINISHING_ARRIVAL_SAVING_MINUTES = 10.0  # earlier departure must save < this in arrival clock time
 DIMINISHING_LOOKBACK_STEPS = 3  # 45 minutes when interval is 15 min

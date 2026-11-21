@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -15,10 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DEFAULT_ROUTE_ID, DUCKDB_PATH, ROUTES  # noqa: E402
+from src.config import DEFAULT_ROUTE_ID, DUCKDB_PATH, MODEL_FEATURES, ROUTES  # noqa: E402
 from src.ingestion.pipeline import get_connection, log_user_trip, run_pipeline  # noqa: E402
-from src.models.predict import predict_departure_curve, summarize_zones  # noqa: E402
-from src.models.train import load_metrics, train_route_models  # noqa: E402
+from src.models.predict import detect_zones, predict_departure_curve, summarize_zones  # noqa: E402
+from src.models.train import load_metrics, load_route_models, train_route_models  # noqa: E402
 
 
 st.set_page_config(page_title="Commute Departure & Delay Risk Optimizer", layout="wide")
@@ -57,39 +58,44 @@ def ensure_data(route_id: str) -> None:
             train_route_models(route_id)
 
 
-def apply_weather_scenario(curve: pd.DataFrame, scenario: str) -> pd.DataFrame:
-    """Apply a simple what-if weather adjustment to predicted durations.
-
-    This keeps the MVP interactive even when forecast data is dry. The adjustment mirrors
-    the model's rain/rush interaction intuition; for production, retrain/predict with scenario features.
-    """
+def apply_weather_scenario(curve: pd.DataFrame, scenario: str, route_id: str) -> pd.DataFrame:
+    """Apply weather what-if by overriding rain features and running real model inference."""
     out = curve.copy()
     if scenario == "Forecast":
         return out
 
-    multipliers = {
-        "Dry": 0.95,
-        "Light rain": 1.08,
-        "Heavy rain": 1.20,
+    scenario_rain_mm = {
+        "Dry": 0.0,
+        "Light rain": 2.5,
+        "Heavy rain": 8.0,
     }
-    mult = multipliers.get(scenario, 1.0)
-    rush = out["rush_intensity"].fillna(0.0)
-    rain_boost = 1.0 + (mult - 1.0) * (0.6 + 0.8 * rush)
-    out["duration_p50_min"] = out["duration_p50_min"] * rain_boost
-    out["duration_p90_min"] = out["duration_p90_min"] * (rain_boost + 0.03 * rush)
-    out["duration_p90_min"] = np_max(out["duration_p90_min"], out["duration_p50_min"] + 1.0)
+    rain_mm = float(scenario_rain_mm.get(scenario, 0.0))
+    out["precipitation_mm"] = rain_mm
+    out["rain_mm"] = rain_mm
+    out["is_raining"] = int(rain_mm > 0.1)
+    out["heavy_rain"] = int(rain_mm >= 5.0)
+
+    # Rolling 3h rain features: for scenario override, assume the same condition persisted.
+    out["precip_rolling_3h"] = rain_mm
+    out["rain_rolling_3h"] = rain_mm
+
+    # Recompute interaction using existing rush_intensity.
+    rush = pd.to_numeric(out.get("rush_intensity", 0.0), errors="coerce").fillna(0.0)
+    out["rain_x_rush"] = out["precipitation_mm"] * rush
+
+    models = load_route_models(route_id)
+    X = out[MODEL_FEATURES].copy()
+    for name, bundle in models.items():
+        pred = np.asarray(bundle["model"].predict(X), dtype=float)
+        out[f"duration_{name}_min"] = np.clip(pred, 5.0, None)
+
+    if "duration_p50_min" in out and "duration_p90_min" in out:
+        out["duration_p90_min"] = np.maximum(out["duration_p90_min"], out["duration_p50_min"] + 1.0)
+
     out["arrival_p50_ts"] = out["departure_ts"] + pd.to_timedelta(out["duration_p50_min"], unit="m")
     out["arrival_p90_ts"] = out["departure_ts"] + pd.to_timedelta(out["duration_p90_min"], unit="m")
     out["risk_spread_min"] = out["duration_p90_min"] - out["duration_p50_min"]
-    from src.models.predict import detect_zones
-
     return detect_zones(out)
-
-
-def np_max(a, b):
-    import numpy as np
-
-    return np.maximum(a, b)
 
 
 def zone_color(zone: str) -> str:
@@ -101,12 +107,11 @@ def zone_color(zone: str) -> str:
     }.get(zone, "#4C78A8")
 
 
-def build_chart(curve: pd.DataFrame) -> alt.Chart:
+def _base_chart(curve: pd.DataFrame) -> tuple[alt.Chart, pd.DataFrame]:
     plot_df = curve.copy()
     plot_df["departure_label"] = plot_df["departure_ts"].dt.strftime("%H:%M")
     plot_df["arrival_p50_label"] = plot_df["arrival_p50_ts"].dt.strftime("%H:%M")
     plot_df["arrival_p90_label"] = plot_df["arrival_p90_ts"].dt.strftime("%H:%M")
-
     base = alt.Chart(plot_df).encode(
         x=alt.X("departure_ts:T", title="Departure time"),
         tooltip=[
@@ -119,14 +124,17 @@ def build_chart(curve: pd.DataFrame) -> alt.Chart:
             alt.Tooltip("zone_reason:N", title="Reason"),
         ],
     )
+    return base, plot_df
 
+
+def build_duration_chart(curve: pd.DataFrame) -> alt.Chart:
+    base, plot_df = _base_chart(curve)
     band = base.mark_area(opacity=0.2, color="#72B7B2").encode(
         y=alt.Y("duration_p50_min:Q", title="Estimated travel duration (minutes)"),
         y2="duration_p90_min:Q",
     )
     p50 = base.mark_line(color="#1f77b4", strokeWidth=2).encode(y="duration_p50_min:Q")
     p90 = base.mark_line(color="#2ca02c", strokeDash=[4, 4], strokeWidth=2).encode(y="duration_p90_min:Q")
-
     points = base.mark_circle(size=55).encode(
         y="duration_p50_min:Q",
         color=alt.Color(
@@ -139,6 +147,28 @@ def build_chart(curve: pd.DataFrame) -> alt.Chart:
         ),
     )
     return (band + p50 + p90 + points).properties(height=420).interactive()
+
+
+def build_arrival_chart(curve: pd.DataFrame) -> alt.Chart:
+    base, _ = _base_chart(curve)
+    p50 = base.mark_line(color="#1f77b4", strokeWidth=2).encode(
+        y=alt.Y("arrival_p50_ts:T", title="Estimated arrival time (clock)"),
+    )
+    p90 = base.mark_line(color="#2ca02c", strokeDash=[4, 4], strokeWidth=2).encode(
+        y="arrival_p90_ts:T",
+    )
+    points = base.mark_circle(size=55).encode(
+        y="arrival_p50_ts:T",
+        color=alt.Color(
+            "zone:N",
+            scale=alt.Scale(
+                domain=["normal", "diminishing_return", "delay_cliff", "high_tail_risk"],
+                range=["#4C78A8", "#F58518", "#E45756", "#B279A2"],
+            ),
+            legend=alt.Legend(title="Zone"),
+        ),
+    )
+    return (p50 + p90 + points).properties(height=420).interactive()
 
 
 def render_alerts(curve: pd.DataFrame) -> None:
@@ -210,7 +240,7 @@ def main() -> None:
     if interval != 15:
         # simple resample by selecting nearest matching interval from 15-min grid
         curve = curve[curve["departure_ts"].dt.minute % interval == 0].copy()
-    curve = apply_weather_scenario(curve, scenario)
+    curve = apply_weather_scenario(curve, scenario, route_id)
 
     summary = summarize_zones(curve)
     c1, c2, c3, c4 = st.columns(4)
@@ -220,8 +250,18 @@ def main() -> None:
     best = curve.loc[curve["duration_p50_min"].idxmin()]
     c4.metric("Best P50 departure", best["departure_ts"].strftime("%H:%M"), f"{best['duration_p50_min']:.0f} min")
 
-    st.subheader("Departure vs. Estimated Duration (P50/P90)")
-    st.altair_chart(build_chart(curve), use_container_width=True)
+    view = st.radio(
+        "Chart view",
+        ["Duration vs Departure", "Arrival Time vs Departure"],
+        horizontal=True,
+    )
+    if view == "Duration vs Departure":
+        st.subheader("Departure vs. Estimated Duration (P50/P90)")
+        st.altair_chart(build_duration_chart(curve), use_container_width=True)
+    else:
+        st.subheader("Departure vs. Estimated Arrival Time (P50/P90 clock time)")
+        st.caption("A flatter arrival curve indicates diminishing returns: leaving earlier barely changes arrival time.")
+        st.altair_chart(build_arrival_chart(curve), use_container_width=True)
     render_alerts(curve)
 
     with st.expander("Departure table", expanded=False):

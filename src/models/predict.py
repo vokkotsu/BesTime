@@ -12,8 +12,9 @@ from src.config import (
     CLIFF_MIN_INCREASE_PCT,
     DEFAULT_TIMEZONE,
     DEPARTURE_INTERVAL_MINUTES,
+    DIMINISHING_ARRIVAL_SAVING_MINUTES,
+    DIMINISHING_ELEVATED_RATIO,
     DIMINISHING_LOOKBACK_STEPS,
-    DIMINISHING_MAX_SAVING_MINUTES,
     DUCKDB_PATH,
     MODEL_FEATURES,
 )
@@ -166,6 +167,14 @@ def detect_zones(curve: pd.DataFrame) -> pd.DataFrame:
     out["zone"] = "normal"
     out["zone_reason"] = ""
 
+    # Ensure arrival columns exist for callers that pass duration-only curves.
+    if "arrival_p50_ts" not in out.columns and "duration_p50_min" in out.columns:
+        out["arrival_p50_ts"] = out["departure_ts"] + pd.to_timedelta(out["duration_p50_min"], unit="m")
+    if "arrival_p90_ts" not in out.columns and "duration_p90_min" in out.columns:
+        out["arrival_p90_ts"] = out["departure_ts"] + pd.to_timedelta(out["duration_p90_min"], unit="m")
+    if "risk_spread_min" not in out.columns and {"duration_p90_min", "duration_p50_min"}.issubset(out.columns):
+        out["risk_spread_min"] = out["duration_p90_min"] - out["duration_p50_min"]
+
     # Delay cliff: large increase compared to previous departure slot.
     prev = out["duration_p50_min"].shift(1)
     delta_min = out["duration_p50_min"] - prev
@@ -179,38 +188,72 @@ def detect_zones(curve: pd.DataFrame) -> pd.DataFrame:
         + " min vs previous slot"
     )
 
-    # Diminishing returns: leaving earlier by lookback window saves very little.
-    # For each point, compare to point LOOKBACK steps earlier (earlier departure).
-    earlier = out["duration_p50_min"].shift(-DIMINISHING_LOOKBACK_STEPS)
-    saving_from_earlier = earlier - out["duration_p50_min"]  # positive if earlier is slower
-    # We want points where departing much earlier yields little/no saving.
-    # Mark earlier slot as diminishing if it doesn't save much compared to current.
-    diminishing_earlier_mask = saving_from_earlier.notna() & (
-        saving_from_earlier <= DIMINISHING_MAX_SAVING_MINUTES
-    )
-    # Apply to earlier indices.
-    earlier_indices = out.index[diminishing_earlier_mask]
-    target_indices = earlier_indices  # mark the earlier departure as diminishing return
-    # Only mark as diminishing if not already a cliff.
-    for idx in target_indices:
-        if out.loc[idx, "zone"] == "normal":
-            save_val = saving_from_earlier.loc[idx]
-            later_idx = idx + DIMINISHING_LOOKBACK_STEPS
-            later_ts = out.loc[later_idx, "departure_ts"] if later_idx < len(out) else None
-            if later_ts is not None:
-                mins = int(DIMINISHING_LOOKBACK_STEPS * DEPARTURE_INTERVAL_MINUTES)
-                out.loc[idx, "zone"] = "diminishing_return"
-                out.loc[idx, "zone_reason"] = (
-                    f"Diminishing return: leaving {mins} min earlier saves <= {DIMINISHING_MAX_SAVING_MINUTES:.0f} min"
-                )
+    # Diminishing returns: only when congestion is elevated above free-flow baseline,
+    # and leaving earlier by lookback window saves little in actual arrival clock time
+    # because the earlier slot sits on a steeper part of the peak.
+    free_flow_baseline = _free_flow_baseline(out)
+    lookback_steps = _lookback_steps(out)
+    earlier_arrival = out["arrival_p50_ts"].shift(lookback_steps)
+    arrival_saving_min = (out["arrival_p50_ts"] - earlier_arrival).dt.total_seconds() / 60.0
+    elevated = out["duration_p50_min"] > (free_flow_baseline * DIMINISHING_ELEVATED_RATIO)
 
-    # Also flag points where P90 spread is very high as elevated tail risk.
-    spread = out["risk_spread_min"]
-    high_spread = spread >= spread.quantile(0.85) if len(out) >= 5 else spread >= 20
+    # Flag the earlier slot as diminishing: it is elevated, and leaving it (earlier)
+    # only saves < threshold minutes in arrival clock time vs departing lookback later.
+    for idx in out.index[earlier_arrival.notna() & arrival_saving_min.notna()]:
+        earlier_idx = idx - lookback_steps
+        if earlier_idx < 0:
+            continue
+        if out.loc[earlier_idx, "zone"] != "normal":
+            continue
+        if not bool(elevated.loc[earlier_idx]):
+            continue
+        saving = float(arrival_saving_min.loc[idx])
+        if saving < DIMINISHING_ARRIVAL_SAVING_MINUTES:
+            mins = int(lookback_steps * _infer_interval_minutes(out))
+            out.loc[earlier_idx, "zone"] = "diminishing_return"
+            out.loc[earlier_idx, "zone_reason"] = (
+                f"Diminishing return: leaving {mins} min earlier saves only {saving:.0f} min "
+                "in arrival time (earlier slot hits steeper congestion)"
+            )
+
+    # High tail risk: elevated P90 spread, but avoid masking cliffs/diminishing returns.
+    spread = pd.to_numeric(out.get("risk_spread_min", 0.0), errors="coerce").fillna(0.0)
+    if len(out) >= 5:
+        q85 = float(spread.quantile(0.85))
+        high_spread = (spread >= q85) & (spread >= 15.0)
+    else:
+        high_spread = spread >= 20.0
     out.loc[high_spread & (out["zone"] == "normal"), "zone"] = "high_tail_risk"
     out.loc[high_spread & (out["zone"] == "normal"), "zone_reason"] = "High tail risk: P90 spread is elevated"
 
     return out
+
+
+def _free_flow_baseline(curve: pd.DataFrame) -> float:
+    """Estimate free-flow baseline from the lower tail of durations."""
+    durations = pd.to_numeric(curve.get("duration_p50_min"), errors="coerce").dropna()
+    if durations.empty:
+        return 35.0
+    # Use a robust lower-tail estimate; avoid being skewed by a single outlier.
+    q20 = float(durations.quantile(0.2))
+    median = float(durations.median())
+    return max(5.0, min(q20, median))
+
+
+def _infer_interval_minutes(curve: pd.DataFrame) -> int:
+    ts = pd.to_datetime(curve["departure_ts"]).sort_values()
+    if len(ts) < 2:
+        return DEPARTURE_INTERVAL_MINUTES
+    delta = ts.diff().dropna().dt.total_seconds() / 60.0
+    if delta.empty:
+        return DEPARTURE_INTERVAL_MINUTES
+    return max(1, int(round(float(delta.median()))))
+
+
+def _lookback_steps(curve: pd.DataFrame) -> int:
+    interval = _infer_interval_minutes(curve)
+    target_minutes = DIMINISHING_LOOKBACK_STEPS * DEPARTURE_INTERVAL_MINUTES
+    return max(1, int(round(target_minutes / interval)))
 
 
 def summarize_zones(curve: pd.DataFrame) -> dict:
