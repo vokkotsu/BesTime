@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+import socket
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.request import urlopen
 
 import altair as alt
 import numpy as np
@@ -203,6 +207,109 @@ def render_alerts(curve: pd.DataFrame) -> None:
         st.success("No major delay cliffs or diminishing-return zones detected for this scenario.")
 
 
+def _check_tcp(host: str, port: int, timeout: float = 0.8) -> tuple[bool, str]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, f"{host}:{port} reachable"
+    except Exception as exc:
+        return False, f"{host}:{port} unreachable ({exc.__class__.__name__})"
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def check_hdfs_namenode(url: str) -> dict[str, str | bool]:
+    try:
+        with urlopen(url, timeout=1.5) as resp:  # noqa: S310 - local infra status check
+            ok = 200 <= resp.status < 400
+            return {"ok": ok, "detail": f"HTTP {resp.status}"}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_realtime_kafka_alerts(
+    bootstrap_servers: str,
+    topic: str = "commute.alerts.realtime",
+    limit: int = 10,
+) -> list[dict]:
+    """Best-effort Kafka alert feed for sidebar. Returns [] when Kafka/client unavailable."""
+    try:
+        from kafka import KafkaConsumer  # type: ignore
+    except Exception:
+        return [{"_status": "unavailable", "message": "kafka-python not installed"}]
+
+    try:
+        consumer = KafkaConsumer(
+            topic,
+            bootstrap_servers=[s.strip() for s in bootstrap_servers.split(",") if s.strip()],
+            auto_offset_reset="latest",
+            enable_auto_commit=False,
+            consumer_timeout_ms=1200,
+            value_deserializer=lambda m: m,
+        )
+    except Exception as exc:
+        return [{"_status": "error", "message": f"Kafka connect failed: {exc.__class__.__name__}"}]
+
+    alerts: list[dict] = []
+    try:
+        for msg in consumer:
+            raw = msg.value
+            try:
+                payload = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+            except Exception:
+                payload = {"message": str(raw)}
+            payload["_partition"] = msg.partition
+            payload["_offset"] = msg.offset
+            alerts.append(payload)
+            if len(alerts) >= limit:
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            consumer.close()
+        except Exception:
+            pass
+
+    return alerts
+
+
+def render_big_data_status_sidebar() -> None:
+    with st.sidebar.expander("Big Data Infrastructure Status", expanded=False):
+        kafka_bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
+        kafka_host, kafka_port_str = (kafka_bootstrap.split(",")[0].strip().split(":") + ["29092"])[:2]
+        try:
+            kafka_port = int(kafka_port_str)
+        except Exception:
+            kafka_port = 29092
+        hdfs_ui_url = os.getenv("HDFS_NAMENODE_UI", "http://localhost:9870")
+
+        kafka_ok, kafka_detail = _check_tcp(kafka_host, kafka_port)
+        hdfs = check_hdfs_namenode(hdfs_ui_url)
+        hdfs_ok = bool(hdfs.get("ok"))
+
+        c1, c2 = st.columns(2)
+        c1.metric("Kafka", "UP" if kafka_ok else "DOWN")
+        c2.metric("HDFS NN", "UP" if hdfs_ok else "DOWN")
+        st.caption(f"Kafka: {kafka_detail}")
+        st.caption(f"HDFS NameNode: {hdfs_ui_url} ({hdfs.get('detail', '')})")
+
+        st.markdown("**Real-time alerts (`commute.alerts.realtime`)**")
+        if st.button("Refresh alerts", key="refresh_kafka_alerts", use_container_width=True):
+            fetch_realtime_kafka_alerts.clear()
+        alerts = fetch_realtime_kafka_alerts(kafka_bootstrap)
+        if not alerts:
+            st.caption("No recent alerts consumed (topic may be idle or no new messages since latest offset).")
+        elif alerts and alerts[0].get("_status") in {"unavailable", "error"}:
+            st.warning(alerts[0].get("message", "Kafka alert feed unavailable"))
+        else:
+            for alert in reversed(alerts[-5:]):
+                alert_type = alert.get("alert_type", "alert")
+                severity = alert.get("severity", "info")
+                route = alert.get("route_id", "?")
+                msg = alert.get("message", "")
+                st.write(f"- [{severity}] {route} `{alert_type}` {msg}")
+
+
 def main() -> None:
     st.title("Commute Departure & Delay Risk Optimizer")
     st.caption(
@@ -221,6 +328,8 @@ def main() -> None:
         target_date = st.date_input("Date", value=date.today())
         scenario = st.selectbox("Weather scenario", ["Forecast", "Dry", "Light rain", "Heavy rain"])
         interval = st.select_slider("Interval (minutes)", options=[10, 15, 20, 30], value=15)
+
+        render_big_data_status_sidebar()
 
         st.divider()
         st.header("Data / Model")

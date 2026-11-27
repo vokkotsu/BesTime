@@ -38,6 +38,11 @@ htmlcov/
 
 # Logs
 *.log
+.logs/
+
+# Big Data local artifacts
+data/lakehouse/
+.spark-stream.log
 
 # Agent/local tooling
 .commandcode/
